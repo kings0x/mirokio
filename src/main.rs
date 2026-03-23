@@ -1,25 +1,35 @@
-use std::sync::Arc;
-use std::{iter, usize};
+use std::arch::global_asm;
+use std::sync::{Arc, Mutex};
+use std::{future, iter, usize};
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::thread::{self, JoinHandle};
 
 use crossbeam::deque::{Injector, Stealer, Worker};
+use crossbeam::queue;
 use crossbeam::sync::Unparker;
-use opentelemetry::global;
+use opentelemetry::{Context, global};
+use std::pin::Pin;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-thread_local! {}
-
-fn main() {
-    println!("Hello, world!");
+//This is used to determine wether the task should be sent to either the global queue if its on the main thread or the worker thread if its on the worker thread
+thread_local! {
+    static CURRENT_WORKER: RefCell<Option<WorkerHandle>> = RefCell::new(None);
 }
 
 thread_local! {
-    static CUREENT_RUNTIME:Cell<Option< *mut Worker<Arc<Task>>>> = Cell::new(None);
-    static CURRENT_WORKER:Cell<Option<*mut Worker<Arc<Task>>>> =Cell::new(None);
+    static GLOBAL_INJECTOR: Arc<Injector<Arc<Task>>> = Arc::new(Injector::new());
+}
+
+#[derive(Clone)]
+pub struct WorkerHandle {
+    queue: Arc<Worker<Arc<Task>>>,
+}
+
+fn main() {
+    println!("Hello, world!");
 }
 
 pub struct mirokio {
@@ -42,7 +52,8 @@ impl mirokio {
             .try_init()
             .unwrap();
 
-        let global = Arc::new(Injector::new());
+        let global = GLOBAL_INJECTOR.with(|val| val.clone());
+
         let mut os_threads: Vec<JoinHandle<()>> = Vec::with_capacity(cap);
 
         //this is the stealer queue
@@ -76,69 +87,95 @@ impl mirokio {
     }
 }
 
+fn find_task(
+    local: &Worker<Arc<Task>>,
+    global: &Injector<Arc<Task>>,
+    stealers: &[Stealer<Arc<Task>>],
+) -> Option<Arc<Task>> {
+    local
+        .pop()
+        .or_else(|| global.steal_batch_and_pop(local).success())
+        .or_else(|| {
+            stealers
+                .iter()
+                .map(|s| s.steal())
+                .find(|s| s.is_success())
+                .and_then(|s| s.success())
+        })
+}
+
 pub fn worker_loop(
     global: Arc<Injector<Arc<Task>>>,
     local: Worker<Arc<Task>>,
     stealers: Arc<Vec<Stealer<Arc<Task>>>>,
 ) {
-    let boxed = Box::new(local);
-    let worker: *mut Worker<Arc<Task>> = Box::into_raw(boxed);
-    CUREENT_RUNTIME.with(|val| {
-        val.set(Some(worker));
-    });
+    let handle = WorkerHandle {
+        queue: Arc::new(local),
+    };
 
-    CURRENT_WORKER.with(|val| {
-        val.set(Some(worker));
-    });
+    CURRENT_WORKER.with(|slot| *slot.borrow_mut() = Some(handle.clone()));
 
     loop {
-        if let Some(task) = unsafe { &mut *worker }.pop().or_else(|| {
-            iter::repeat_with(|| {
-                global
-                    .steal_batch_and_pop(unsafe { &*worker })
-                    .or_else(|| stealers.iter().map(|s| s.steal()).collect())
-            })
-            .find(|s| !s.is_retry())
-            .and_then(|s| s.success())
-        }) {
+        if let Some(task) = find_task(&handle.queue, &global, &stealers) {
             task.poll();
+        } else {
+            std::thread::yield_now();
         }
     }
 }
 
-pub fn spawn<F>(future: F) {
-    let global = CUREENT_RUNTIME.with(|val| val.get());
+pub fn spawn<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let future = Mutex::new(Box::pin(future) as Pin<Box<dyn Future<Output = ()> + Send>>);
 
-    let local = CURRENT_WORKER.with(|val| val.get());
+    let task = Arc::new(Task {
+        future,
+        queue: Mutex::new(None),
+    });
 
-    if let Some(queue) = local {
-        Task::spawn(future, queue);
+    let queue = if let Some(handle) = CURRENT_WORKER.with(|slot| slot.borrow().clone()) {
+        handle.queue.push(task.clone());
+        TaskQueue::Worker
     } else {
-        if let Some(queue) = global {
-            Task::spawn(future, queue);
-        }
-    }
+        GLOBAL_INJECTOR.with(|global| {
+            global.push(task.clone());
+            TaskQueue::Global(global.clone())
+        })
+    };
+
+    task.set_queue(queue);
+}
+
+enum TaskQueue {
+    Worker,
+    Global(Arc<Injector<Arc<Task>>>),
 }
 pub struct Task {
-    task_future: TaskFuture,
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    queue: Mutex<Option<TaskQueue>>,
 }
 
 impl Task {
-    pub fn schedule(self: Arc<Self>, sender: *mut Worker<Arc<Task>>) {
-        unsafe {
-            (*sender).push(self.clone());
+    pub fn schedule(self: Arc<Self>) {
+        if let Some(ref queue) = *self.queue.lock().unwrap() {
+            match queue {
+                TaskQueue::Global(global) => global.push(self.clone()),
+
+                TaskQueue::Worker => {
+                    if let Some(queue) = CURRENT_WORKER.with(|slot| slot.borrow().clone()) {
+                        queue.queue.push(self.clone());
+                    }
+                }
+            }
         }
     }
 
-    pub fn spawn<F>(future: F, sender: *mut Worker<Arc<Task>>) {
-        let task_future = TaskFuture {};
+    fn poll(self: Arc<Self>) {}
 
-        let task = Arc::new(Task { task_future });
-
-        task.schedule(sender);
+    pub fn set_queue(&self, queue: TaskQueue) {
+        let mut lock = self.queue.lock().unwrap();
+        *lock = Some(queue)
     }
-
-    fn poll(&self) {}
 }
-
-pub struct TaskFuture {}
