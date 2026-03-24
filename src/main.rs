@@ -1,15 +1,16 @@
-use std::arch::global_asm;
+use std::io::Take;
 use std::sync::{Arc, Mutex};
-use std::{future, iter, usize};
+use std::usize;
 
 use std::cell::RefCell;
 use std::thread::{self, JoinHandle};
 
 use crossbeam::deque::{Injector, Stealer, Worker};
-use crossbeam::queue;
+
 use crossbeam::sync::Unparker;
 use opentelemetry::{Context, global};
 use std::pin::Pin;
+use std::task::{self, RawWaker, RawWakerVTable, Waker};
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -172,10 +173,65 @@ impl Task {
         }
     }
 
-    fn poll(self: Arc<Self>) {}
+    fn poll(self: Arc<Self>) {
+        let waker = task_waker(self.clone());
+        let mut cx = task::Context::from_waker(&waker);
+        let mut future = self.future.lock().unwrap();
+        if let task::Poll::Pending = future.as_mut().poll(&mut cx) {
+            //The future would wake it self later
+        }
+    }
 
-    pub fn set_queue(&self, queue: TaskQueue) {
+    fn set_queue(&self, queue: TaskQueue) {
         let mut lock = self.queue.lock().unwrap();
         *lock = Some(queue)
     }
+}
+
+//This is just a helper to hold the task
+struct TaskWaker {
+    task: Arc<Task>,
+}
+
+impl TaskWaker {
+    fn wake_task(task: Arc<Task>) {
+        task.schedule();
+    }
+}
+
+//This creates the rawwaker vtable funtionality and creates the rawtable with them, to be used to build the waker
+fn raw_waker(task: Arc<Task>) -> RawWaker {
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        let arc = unsafe { Arc::<Task>::from_raw(data as *const Task) };
+        let cloned = arc.clone();
+        std::mem::forget(arc);
+        raw_waker(cloned)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        let arc = unsafe { Arc::<Task>::from_raw(data as *const Task) };
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        let arc = unsafe { Arc::<Task>::from_raw(data as *const Task) };
+        let cloned = arc.clone();
+        TaskWaker::wake_task(cloned);
+        std::mem::forget(arc);
+    }
+
+    unsafe fn drop(data: *const ()) {
+        unsafe {
+            core::mem::drop(Arc::<Task>::from_raw(data as *const Task));
+        }
+    }
+
+    RawWaker::new(
+        Arc::into_raw(task) as *const (),
+        &RawWakerVTable::new(clone, wake, wake_by_ref, drop),
+    )
+}
+
+//task_waker creates the waker that would now be passed to context and be sent out
+fn task_waker(task: Arc<Task>) -> Waker {
+    unsafe { Waker::from_raw(raw_waker(task)) }
 }
