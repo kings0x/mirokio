@@ -1,6 +1,5 @@
-use std::io::Take;
 use std::sync::{Arc, Mutex};
-use std::usize;
+use std::time::Instant;
 
 use std::cell::RefCell;
 use std::thread::{self, JoinHandle};
@@ -9,8 +8,11 @@ use crossbeam::deque::{Injector, Stealer, Worker};
 
 use crossbeam::sync::Unparker;
 use opentelemetry::{Context, global};
+use std::collections::BinaryHeap;
+use std::future::Future;
 use std::pin::Pin;
-use std::task::{self, RawWaker, RawWakerVTable, Waker};
+use std::sync::OnceLock;
+use std::task::{self, RawWaker, RawWakerVTable, Wake, Waker};
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -23,6 +25,8 @@ thread_local! {
 thread_local! {
     static GLOBAL_INJECTOR: Arc<Injector<Arc<Task>>> = Arc::new(Injector::new());
 }
+
+static TIMER: OnceLock<Arc<Timer>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct WorkerHandle {
@@ -81,6 +85,12 @@ impl mirokio {
 
             os_threads.push(os_thread);
         }
+
+        let timer = Arc::new(Timer::new());
+
+        TIMER.set(timer.clone()).unwrap();
+
+        start_timer_driver(timer.clone());
 
         Self {
             workers: os_threads,
@@ -210,6 +220,7 @@ fn raw_waker(task: Arc<Task>) -> RawWaker {
 
     unsafe fn wake(data: *const ()) {
         let arc = unsafe { Arc::<Task>::from_raw(data as *const Task) };
+        TaskWaker::wake_task(arc);
     }
 
     unsafe fn wake_by_ref(data: *const ()) {
@@ -234,4 +245,124 @@ fn raw_waker(task: Arc<Task>) -> RawWaker {
 //task_waker creates the waker that would now be passed to context and be sent out
 fn task_waker(task: Arc<Task>) -> Waker {
     unsafe { Waker::from_raw(raw_waker(task)) }
+}
+
+//===========
+//Async sleep Timer System
+//===========
+
+//we need to know when to wake so we store the time to
+//wake and the waker when, waker
+//then a seperate thread would watch the time, so when its its time is reached it calls waker.wake()
+
+use std::cmp::Ordering;
+use std::time::Duration;
+
+#[derive(Debug)]
+struct TimerEntry {
+    when: Instant,
+    waker: Waker,
+}
+
+impl Ord for TimerEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        //reverse for min-heap
+        other.when.cmp(&self.when)
+    }
+}
+
+impl PartialOrd for TimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.when == other.when
+    }
+}
+
+impl Eq for TimerEntry {}
+
+#[derive(Debug)]
+struct Timer {
+    heap: Mutex<BinaryHeap<TimerEntry>>,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            heap: Mutex::new(BinaryHeap::new()),
+        }
+    }
+
+    fn register(&self, when: Instant, waker: Waker) {
+        let mut heap = self.heap.lock().unwrap();
+        heap.push(TimerEntry { when, waker });
+    }
+}
+
+fn start_timer_driver(timer: Arc<Timer>) {
+    thread::spawn(move || {
+        loop {
+            let now = Instant::now();
+
+            let mut heap = timer.heap.lock().unwrap();
+
+            while let Some(entry) = heap.peek() {
+                if entry.when <= now {
+                    let entry = heap.pop().unwrap();
+                    entry.waker.wake(); //this is the magic
+                } else {
+                    break;
+                }
+            }
+
+            drop(heap);
+
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+}
+
+pub struct Sleep {
+    when: Instant,
+    registered: bool,
+}
+
+impl Sleep {
+    pub fn new(duration: Duration) -> Self {
+        Self {
+            when: Instant::now() + duration,
+            registered: false,
+        }
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<()> {
+        let this = self.get_mut();
+        if Instant::now() > this.when {
+            return task::Poll::Ready(());
+        }
+
+        if !this.registered {
+            let waker = cx.waker().clone();
+
+            if let Some(timer) = TIMER.get() {
+                timer.register(this.when, waker);
+            }
+
+            this.registered = true;
+        }
+
+        task::Poll::Pending
+    }
+}
+
+pub fn sleep(duration: Duration) -> Sleep {
+    Sleep::new(duration)
 }
