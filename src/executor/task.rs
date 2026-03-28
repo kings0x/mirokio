@@ -44,10 +44,7 @@ impl Task {
     }
 }
 
-//This is just a helper to hold the task
-pub struct TaskWaker {
-    task: Arc<Task>,
-}
+pub struct TaskWaker();
 
 impl TaskWaker {
     fn wake_task(task: Arc<Task>) {
@@ -97,8 +94,6 @@ fn task_waker(task: Arc<Task>) -> Waker {
 mod test {
     use crossbeam::deque::Worker;
 
-    use crate::executor::workers;
-
     use super::*;
     use std::{
         future::Future,
@@ -113,7 +108,7 @@ mod test {
 
     impl Future for OurFuture {
         type Output = ();
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
             self.poll_count.fetch_add(1, Ordering::SeqCst);
 
             if self.is_completed.load(Ordering::SeqCst) {

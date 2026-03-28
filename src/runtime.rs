@@ -1,17 +1,10 @@
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Arc;
 
-use std::cell::RefCell;
 use std::thread::{self, JoinHandle};
 
 use crossbeam::deque::{Injector, Stealer, Worker};
 
-use crossbeam::sync::Unparker;
 use opentelemetry::{Context, global};
-use std::collections::BinaryHeap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::OnceLock;
 
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
