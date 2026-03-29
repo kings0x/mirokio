@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use std::thread::{self, JoinHandle};
 
 use crossbeam::deque::{Injector, Stealer, Worker};
 
-use opentelemetry::{Context, global};
+use opentelemetry::global;
 
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -14,11 +14,10 @@ use crate::executor::task::*;
 use crate::executor::workers::*;
 use crate::timer::*;
 
-//This is used to determine wether the task should be sent to either the global queue if its on the main thread or the worker thread if its on the worker thread
-
-thread_local! {
-    pub static GLOBAL_INJECTOR: Arc<Injector<Arc<Task>>> = Arc::new(Injector::new());
-}
+// This is shared across the whole runtime process.
+// Spawn calls from outside worker threads should all target the same injector,
+// no matter which OS thread initiated the spawn.
+pub static GLOBAL_INJECTOR: OnceLock<Arc<Injector<Arc<Task>>>> = OnceLock::new();
 
 pub struct mirokio {
     workers: Vec<JoinHandle<()>>,
@@ -40,7 +39,9 @@ impl mirokio {
             .try_init()
             .unwrap();
 
-        let global = GLOBAL_INJECTOR.with(|val| val.clone());
+        let global = GLOBAL_INJECTOR
+            .get_or_init(|| Arc::new(Injector::new()))
+            .clone();
 
         let mut os_threads: Vec<JoinHandle<()>> = Vec::with_capacity(cap);
 

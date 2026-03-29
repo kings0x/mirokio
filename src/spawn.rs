@@ -23,10 +23,11 @@ where
         handle.queue.push(task.clone());
         TaskQueue::Worker
     } else {
-        GLOBAL_INJECTOR.with(|global| {
-            global.push(task.clone());
-            TaskQueue::Global(global.clone())
-        })
+        let global = GLOBAL_INJECTOR
+            .get_or_init(|| Arc::new(crossbeam::deque::Injector::new()))
+            .clone();
+        global.push(task.clone());
+        TaskQueue::Global(global)
     };
 
     task.set_queue(queue);
