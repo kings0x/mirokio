@@ -86,7 +86,7 @@ fn raw_waker(task: Arc<Task>) -> RawWaker {
 }
 
 //task_waker creates the waker that would now be passed to context and be sent out
-fn task_waker(task: Arc<Task>) -> Waker {
+pub fn task_waker(task: Arc<Task>) -> Waker {
     unsafe { Waker::from_raw(raw_waker(task)) }
 }
 
@@ -119,7 +119,7 @@ mod test {
         }
     }
 
-    fn our_task() -> (Arc<Task>, Arc<AtomicU8>, Arc<AtomicBool>) {
+    fn make_task() -> (Arc<Task>, Arc<AtomicU8>, Arc<AtomicBool>) {
         let poll_count = Arc::new(AtomicU8::new(0));
         let is_completed = Arc::new(AtomicBool::new(false));
         let future = OurFuture {
@@ -137,7 +137,7 @@ mod test {
 
     #[test]
     fn test_task_polls_future_to_completion() {
-        let (task, poll_count, is_completed) = our_task();
+        let (task, poll_count, is_completed) = make_task();
         is_completed.store(true, Ordering::SeqCst);
         task.clone().poll();
         assert_eq!(poll_count.load(Ordering::SeqCst), 1)
@@ -147,7 +147,7 @@ mod test {
     fn test_task_waker_reschedules_on_wake() {
         let global = Arc::new(Injector::new());
         let global_queue = TaskQueue::Global(global.clone());
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
 
         task.set_queue(global_queue);
 
@@ -164,7 +164,7 @@ mod test {
 
     #[test]
     fn test_task_waker_clone_increments_refcount() {
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
 
         let before = Arc::strong_count(&task);
 
@@ -185,7 +185,7 @@ mod test {
     #[test]
     fn test_task_waker_drop_decrements_refcount() {
         let global = Arc::new(Injector::<Arc<Task>>::new());
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
         task.set_queue(TaskQueue::Global(global.clone()));
 
         let before = Arc::strong_count(&task);
@@ -206,7 +206,7 @@ mod test {
     #[test]
     fn test_task_set_queue_stores_correctly() {
         let global = Arc::new(Injector::<Arc<Task>>::new());
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
 
         assert!(task.queue.lock().unwrap().is_none());
 
@@ -223,7 +223,7 @@ mod test {
     fn test_task_schedule_global_pushes_to_injector() {
         let global = Arc::new(Injector::<Arc<Task>>::new());
 
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
         task.set_queue(TaskQueue::Global(global.clone()));
 
         task.clone().schedule();
@@ -241,7 +241,7 @@ mod test {
             queue: worker.clone(),
         };
         CURRENT_WORKER.with(|val| *val.borrow_mut() = Some(worker_handle));
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
 
         task.clone().set_queue(TaskQueue::Worker);
         task.clone().schedule();
@@ -264,7 +264,7 @@ mod test {
     fn test_task_schedule_worker_outside_worker_thread_is_noop() {
         CURRENT_WORKER.with(|slot| *slot.borrow_mut() = None);
 
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
         task.set_queue(TaskQueue::Worker);
         task.clone().schedule();
         // The "task should be silently dropped" path is the known bug documented above.
@@ -274,7 +274,7 @@ mod test {
     fn test_task_waker_wake_by_ref_does_not_consume() {
         let global = Arc::new(Injector::new());
         let global_queue = TaskQueue::Global(global.clone());
-        let (task, _, _) = our_task();
+        let (task, _, _) = make_task();
 
         task.set_queue(global_queue);
         let before = Arc::strong_count(&task);
