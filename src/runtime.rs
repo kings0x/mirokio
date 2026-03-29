@@ -25,6 +25,8 @@ pub struct mirokio {
 
 impl mirokio {
     pub fn new(cap: usize) -> Self {
+        assert!(cap > 0, "runtime requires at least one worker thread");
+
         global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
         let tracer = opentelemetry_jaeger::new_pipeline()
             .with_service_name("mirokio")
@@ -79,5 +81,9 @@ impl mirokio {
         Self {
             workers: os_threads,
         }
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
     }
 }

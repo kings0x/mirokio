@@ -1,4 +1,5 @@
 use std::sync::{
+    Arc,
     Mutex, MutexGuard, Once, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
@@ -130,5 +131,29 @@ fn test_multiple_spawned_tasks_all_complete() {
             completed.load(Ordering::SeqCst) == task_count
         }),
         "all spawned tasks should eventually complete"
+    );
+}
+
+#[test]
+fn test_high_contention_many_tasks_many_threads() {
+    let _guard = integration_test_guard();
+    ensure_runtime();
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let task_count = 128;
+
+    for i in 0..task_count {
+        let completed_clone = completed.clone();
+        spawn(async move {
+            sleep(Duration::from_millis((i % 5) as u64)).await;
+            completed_clone.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    assert!(
+        wait_until(Duration::from_millis(3000), || {
+            completed.load(Ordering::SeqCst) == task_count
+        }),
+        "high-contention task burst should still allow every task to complete"
     );
 }
