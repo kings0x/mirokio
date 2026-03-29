@@ -3,6 +3,7 @@ use crossbeam::deque::Injector;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{self, RawWaker, RawWakerVTable, Waker};
 
 pub enum TaskQueue {
@@ -12,6 +13,7 @@ pub enum TaskQueue {
 pub struct Task {
     pub future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
     pub queue: Mutex<Option<TaskQueue>>,
+    pub completed: AtomicBool,
 }
 
 impl Task {
@@ -30,11 +32,24 @@ impl Task {
     }
 
     pub fn poll(self: Arc<Self>) {
+        if self.completed.load(Ordering::Acquire) {
+            return;
+        }
+
         let waker = task_waker(self.clone());
         let mut cx = task::Context::from_waker(&waker);
         let mut future = self.future.lock().unwrap();
-        if let task::Poll::Pending = future.as_mut().poll(&mut cx) {
-            //The future would wake it self later
+        if self.completed.load(Ordering::Acquire) {
+            return;
+        }
+
+        match future.as_mut().poll(&mut cx) {
+            task::Poll::Pending => {
+                //The future would wake it self later
+            }
+            task::Poll::Ready(()) => {
+                self.completed.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -130,9 +145,45 @@ mod test {
         let task = Arc::new(Task {
             future: Mutex::new(Box::pin(future)),
             queue: Mutex::new(None),
+            completed: AtomicBool::new(false),
         });
 
         (task, poll_count, is_completed)
+    }
+
+    struct ReadyOnceFuture {
+        polled_after_ready: Arc<AtomicBool>,
+        completed: bool,
+    }
+
+    impl Future for ReadyOnceFuture {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.completed {
+                self.polled_after_ready.store(true, Ordering::SeqCst);
+                panic!("future was polled after returning Ready");
+            }
+
+            self.completed = true;
+            Poll::Ready(())
+        }
+    }
+
+    fn make_ready_once_task() -> (Arc<Task>, Arc<AtomicBool>) {
+        let polled_after_ready = Arc::new(AtomicBool::new(false));
+        let future = ReadyOnceFuture {
+            polled_after_ready: polled_after_ready.clone(),
+            completed: false,
+        };
+
+        let task = Arc::new(Task {
+            future: Mutex::new(Box::pin(future)),
+            queue: Mutex::new(None),
+            completed: AtomicBool::new(false),
+        });
+
+        (task, polled_after_ready)
     }
 
     #[test]
@@ -195,7 +246,6 @@ mod test {
             assert_eq!(Arc::strong_count(&task), before + 1); //2
             drop(waker); // -1
         }
-        dbg!(Arc::strong_count(&task));
         assert_eq!(
             Arc::strong_count(&task),
             before,
@@ -288,5 +338,51 @@ mod test {
         drop(waker);
 
         assert_eq!(Arc::strong_count(&task), before + 1)
+    }
+
+    // Edge Cases and Correctness
+    #[test]
+    fn test_task_polled_after_ready_does_not_panic() {
+        let (task, polled_after_ready) = make_ready_once_task();
+
+        task.clone().poll();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            task.clone().poll();
+        }));
+
+        assert!(
+            result.is_ok(),
+            "task poll should not panic if called again after the future completed"
+        );
+        assert!(
+            !polled_after_ready.load(Ordering::SeqCst),
+            "task should not poll the future again after it has completed"
+        );
+    }
+
+    #[test]
+    fn test_waker_called_after_task_dropped_does_not_panic() {
+        let global = Arc::new(Injector::new());
+        let (task, _, _) = make_task();
+        task.set_queue(TaskQueue::Global(global.clone()));
+
+        let waker = task_waker(task.clone());
+        drop(task);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            waker.wake();
+        }));
+
+        assert!(
+            result.is_ok(),
+            "waking after dropping the original task handle should not panic"
+        );
+
+        let worker = Worker::new_lifo();
+        assert!(
+            global.steal_batch_and_pop(&worker).success().is_some(),
+            "task should still be rescheduled while a waker retains ownership"
+        );
     }
 }

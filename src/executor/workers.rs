@@ -97,6 +97,7 @@ mod test {
         let task = Arc::new(Task {
             future: Mutex::new(Box::pin(future)),
             queue: Mutex::new(None),
+            completed: std::sync::atomic::AtomicBool::new(false),
         });
 
         (task, poll_count, is_completed)

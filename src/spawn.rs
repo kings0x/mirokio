@@ -16,6 +16,7 @@ where
     let task = Arc::new(Task {
         future,
         queue: Mutex::new(None),
+        completed: std::sync::atomic::AtomicBool::new(false),
     });
 
     let queue = if let Some(handle) = CURRENT_WORKER.with(|slot| slot.borrow().clone()) {

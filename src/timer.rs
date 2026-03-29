@@ -465,4 +465,51 @@ mod test {
         assert!(matches!(Pin::new(&mut sleep).poll(&mut cx), Poll::Ready(())));
         reset_sleep_clock();
     }
+
+    // Edge Cases and Correctness
+    #[test]
+    fn test_timer_entry_eq_same_instant() {
+        let when = Instant::now();
+        let (left_waker, _) = counting_waker();
+        let (right_waker, _) = counting_waker();
+
+        let left = TimerEntry {
+            when,
+            waker: left_waker,
+        };
+        let right = TimerEntry {
+            when,
+            waker: right_waker,
+        };
+
+        assert_eq!(
+            left, right,
+            "entries with the same deadline should compare equal"
+        );
+    }
+
+    #[test]
+    fn test_timer_entry_ord_reverse_for_min_heap() {
+        let when = Instant::now();
+        let (first_waker, _) = counting_waker();
+        let (later_waker, _) = counting_waker();
+
+        let first = TimerEntry {
+            when,
+            waker: first_waker,
+        };
+        let later = TimerEntry {
+            when: when + Duration::from_millis(1),
+            waker: later_waker,
+        };
+
+        assert!(
+            first.cmp(&later).is_gt(),
+            "TimerEntry ordering should be reversed so earlier deadlines win in BinaryHeap"
+        );
+        assert!(
+            later.cmp(&first).is_lt(),
+            "later deadlines should have lower priority than earlier ones"
+        );
+    }
 }
